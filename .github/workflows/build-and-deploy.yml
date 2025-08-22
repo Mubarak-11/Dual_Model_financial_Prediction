@@ -1,0 +1,111 @@
+name: Build & Deploy Paysim API
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Login to Azure with the SP JSON you put in AZURE_CREDENTIALS
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      # Extract registry hostname (e.g., containerregfrauddetect.azurecr.io)
+      - name: Resolve ACR
+        id: acr
+        run: |
+          echo "REGISTRY=${{ secrets.AZURE_CONTAINER_REGISTRY }}" >> $GITHUB_OUTPUT
+
+      # Docker login to ACR using the same SP creds
+      - name: Docker login to ACR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ steps.acr.outputs.REGISTRY }}
+          username: ${{ fromJson(secrets.AZURE_CREDENTIALS).clientId }}
+          password: ${{ fromJson(secrets.AZURE_CREDENTIALS).clientSecret }}
+
+      # Build & push image using your Dockerfile at repo root
+      - name: Build & Push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ${{ steps.acr.outputs.REGISTRY }}/paysim-api:latest
+            ${{ steps.acr.outputs.REGISTRY }}/paysim-api:${{ github.sha }}
+
+      # Make sure Container Apps env exists (idempotent)
+      - name: Ensure Container Apps Env
+        run: |
+          RG="${{ secrets.AZURE_RESOURCE_GROUP }}"
+          APP="${{ secrets.AZURE_CONTAINERAPP_NAME }}"
+          ENV="env-$APP"
+
+          # Register provider if needed
+          if ! az provider show --namespace Microsoft.App --query "registrationState" -o tsv | grep -qi Registered; then
+            az provider register --namespace Microsoft.App
+          fi
+
+          # Log Analytics workspace (needed by Container Apps)
+          if ! az monitor log-analytics workspace show -g "$RG" -n "law-$APP" &>/dev/null; then
+            az monitor log-analytics workspace create -g "$RG" -n "law-$APP"
+          fi
+          LAW_ID=$(az monitor log-analytics workspace show -g "$RG" -n "law-$APP" --query customerId -o tsv)
+          LAW_KEY=$(az monitor log-analytics workspace get-shared-keys -g "$RG" -n "law-$APP" --query primarySharedKey -o tsv)
+
+          # Container Apps environment
+          if ! az containerapp env show -g "$RG" -n "$ENV" &>/dev/null; then
+            az containerapp env create -g "$RG" -n "$ENV" \
+              --logs-workspace-id "$LAW_ID" --logs-workspace-key "$LAW_KEY"
+          fi
+
+      # Create or update the app with the new image
+      - name: Create/Update Container App
+        id: deploy
+        run: |
+          RG="${{ secrets.AZURE_RESOURCE_GROUP }}"
+          APP="${{ secrets.AZURE_CONTAINERAPP_NAME }}"
+          ENV="env-$APP"
+          IMAGE="${{ steps.acr.outputs.REGISTRY }}/paysim-api:latest"
+          REG="${{ steps.acr.outputs.REGISTRY }}"
+
+          if az containerapp show -g "$RG" -n "$APP" &>/dev/null; then
+            az containerapp update \
+              -g "$RG" -n "$APP" \
+              --image "$IMAGE" \
+              --registry-server "$REG" \
+              --target-port 8000 \
+              --ingress external \
+              --min-replicas 0 --max-replicas 1 \
+              --cpu 0.25 --memory 0.5Gi >/dev/null
+          else
+            az containerapp create \
+              -g "$RG" -n "$APP" \
+              --environment "env-$APP" \
+              --image "$IMAGE" \
+              --registry-server "$REG" \
+              --target-port 8000 \
+              --ingress external \
+              --min-replicas 0 --max-replicas 1 \
+              --cpu 0.25 --memory 0.5Gi >/dev/null
+          fi
+
+          # Output the public FQDN
+          FQDN=$(az containerapp show -g "$RG" -n "$APP" --query "properties.configuration.ingress.fqdn" -o tsv)
+          echo "FQDN=$FQDN" >> $GITHUB_OUTPUT
+
+      - name: Show public URL
+        run: echo "https://${{ steps.deploy.outputs.FQDN }}"
