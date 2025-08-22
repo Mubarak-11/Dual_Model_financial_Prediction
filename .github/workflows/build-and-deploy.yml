@@ -12,20 +12,31 @@ jobs:
       id-token: write
       contents: read
 
+    # <<<-- YOUR NON-SECRET SETTINGS -->>>
     env:
-      # Non-sensitive values: set them here plainly
-      RESOURCE_GROUP: Fraud_detection          # <- keep your existing RG (underscores are OK for RGs)
-      APP_NAME: paysim-api                     # <- ensure only letters/numbers/hyphens
-      REGISTRY: ${{ secrets.AZURE_CONTAINER_REGISTRY }}
+      RESOURCE_GROUP: Fraud_detection                 # must match your RG in Azure
+      APP_NAME: paysim-api                            # your Container App name
+      REGISTRY: containerregfrauddetect.azurecr.io    # ACR login server (no https://, no trailing /)
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Azure Login
+      - name: Azure Login (OIDC)
         uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Verify REGISTRY env
+        run: |
+          echo "REGISTRY=$REGISTRY"
+          if [ -z "$REGISTRY" ]; then
+            echo "ERROR: REGISTRY env is empty. Set it in the job env block."
+            exit 1
+          fi
+          case "$REGISTRY" in
+            http*|*/*) echo "ERROR: REGISTRY must be just the hostname (e.g. containerregfrauddetect.azurecr.io)"; exit 1 ;;
+          esac
 
       - name: Docker login to ACR
         uses: docker/login-action@v3
@@ -44,33 +55,39 @@ jobs:
             ${{ env.REGISTRY }}/paysim-api:latest
             ${{ env.REGISTRY }}/paysim-api:${{ github.sha }}
 
-      - name: Ensure Container Apps Env
+      - name: Ensure Container Apps provider and environment
         run: |
           set -e
           RG="${RESOURCE_GROUP}"
           APP="${APP_NAME}"
 
-          # Sanitize for resources that require strict names (letters/numbers/hyphens)
+          # Some Azure resources require strictly [a-z0-9-] names. Sanitize for LA workspace/env.
           SAFE_APP=$(echo "$APP" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | sed 's/^-//;s/-$//')
           WS="law-$SAFE_APP"
           ENV="env-$SAFE_APP"
 
-          # Create Log Analytics workspace if missing
+          # Make sure Microsoft.App provider is registered
+          if ! az provider show --namespace Microsoft.App --query "registrationState" -o tsv | grep -qi Registered; then
+            az provider register --namespace Microsoft.App
+          fi
+
+          # Create Log Analytics workspace if needed
           if ! az monitor log-analytics workspace show -g "$RG" -n "$WS" &>/dev/null; then
             az monitor log-analytics workspace create -g "$RG" -n "$WS"
           fi
           LAW_ID=$(az monitor log-analytics workspace show -g "$RG" -n "$WS" --query customerId -o tsv)
           LAW_KEY=$(az monitor log-analytics workspace get-shared-keys -g "$RG" -n "$WS" --query primarySharedKey -o tsv)
 
-          # Create Container Apps env if missing
+          # Create Container Apps environment if needed
           if ! az containerapp env show -g "$RG" -n "$ENV" &>/dev/null; then
             az containerapp env create -g "$RG" -n "$ENV" \
-              --logs-workspace-id "$LAW_ID" --logs-workspace-key "$LAW_KEY"
+              --logs-workspace-id "$LAW_ID" \
+              --logs-workspace-key "$LAW_KEY"
           fi
 
           echo "ENV_NAME=$ENV" >> $GITHUB_ENV
 
-      - name: Create/Update Container App
+      - name: Create or Update Container App
         id: deploy
         run: |
           set -e
@@ -78,12 +95,14 @@ jobs:
           APP="${APP_NAME}"
           ENV="${ENV_NAME}"
           IMAGE="${REGISTRY}/paysim-api:latest"
+          REG="${REGISTRY}"
 
+          # Create if missing, otherwise update
           if az containerapp show -g "$RG" -n "$APP" &>/dev/null; then
             az containerapp update \
               -g "$RG" -n "$APP" \
               --image "$IMAGE" \
-              --registry-server "$REGISTRY" \
+              --registry-server "$REG" \
               --target-port 8000 \
               --ingress external \
               --min-replicas 0 --max-replicas 1 \
@@ -93,7 +112,7 @@ jobs:
               -g "$RG" -n "$APP" \
               --environment "$ENV" \
               --image "$IMAGE" \
-              --registry-server "$REGISTRY" \
+              --registry-server "$REG" \
               --target-port 8000 \
               --ingress external \
               --min-replicas 0 --max-replicas 1 \
