@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc 
+*.pyo
+*.pyd
+*.ipynb
+*.log
+.git
+.gitignore
+*.parquet
+artificats/**/model_full.pt
+regress_artificats/**/model_full.pt
+
