@@ -1,12 +1,18 @@
+# Python/build noise
 __pycache__/
-*.pyc 
-*.pyo
-*.pyd
-*.ipynb
-*.log
+*.pyc
+.venv/
+.env
+
+# VCS / tooling
 .git
 .gitignore
-*.parquet
-artificats/**/model_full.pt
-regress_artificats/**/model_full.pt
+.github/
 
+# Large local data / notebooks
+*.ipynb
+*.parquet
+*.csv
+
+# Azure local dirs (if any)
+.azure/
