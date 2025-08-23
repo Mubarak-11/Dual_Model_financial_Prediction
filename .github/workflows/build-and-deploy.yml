@@ -44,8 +44,14 @@ jobs:
           set -euo pipefail
 
           REG=$(az acr show -n "$ACR" -g "$RG" --query loginServer -o tsv)
+          USER=$(az acr credential show -n "$ACR" -g "$RG" --query username -o tsv)
+          PASS=$(az acr credential show -n "$ACR" -g "$RG" --query "passwords[0].value" -o tsv)
+
           IMAGE_SHA="$REG/$IMAGE_REPO:$TAG"
           IMAGE_LATEST="$REG/$IMAGE_REPO:latest"
+          echo "Registry:  $REG"
+          echo "Image-SHA: $IMAGE_SHA"
+          echo "Image-latest: $IMAGE_LATEST"
 
           echo "== Login Docker to ACR via az =="
           az acr login -n "$ACR"
@@ -57,46 +63,49 @@ jobs:
           docker push "$IMAGE_SHA"
           docker push "$IMAGE_LATEST"
 
-          echo "IMAGE_SHA=$IMAGE_SHA" >> $GITHUB_ENV
           echo "REG=$REG" >> $GITHUB_ENV
+          echo "IMAGE_SHA=$IMAGE_SHA" >> $GITHUB_ENV
+          echo "USER=$USER" >> $GITHUB_ENV
+          echo "PASS=$PASS" >> $GITHUB_ENV
 
       - name: Create/Update Container App
         id: deploy
         shell: bash
         run: |
           set -euo pipefail
-          # Create if missing
+
+          echo "== Create or Update app =="
           if az containerapp show -g "$RG" -n "$APP" >/dev/null 2>&1; then
-            echo "Updating existing app image…"
             az containerapp update -g "$RG" -n "$APP" --image "$IMAGE_SHA"
           else
-            echo "Creating app…"
             az containerapp create -g "$RG" -n "$APP" --environment "$ACA_ENV" --image "$IMAGE_SHA"
           fi
 
-          echo "== Attach registry (compat subcommand) =="
-          # If admin user is disabled, this still works since the app uses managed pull via az session;
-          # if you want explicit creds, uncomment the next 3 lines:
-          # USER=$(az acr credential show -n "$ACR" -g "$RG" --query username -o tsv)
-          # PASS=$(az acr credential show -n "$ACR" -g "$RG" --query "passwords[0].value" -o tsv)
-          # az containerapp registry set -g "$RG" -n "$APP" --server "$REG" --username "$USER" --password "$PASS"
-          az containerapp registry set -g "$RG" -n "$APP" --server "$REG" || true
+          echo "== Attach registry (explicit creds for compatibility) =="
+          az containerapp registry set -g "$RG" -n "$APP" \
+            --server "$REG" --username "$USER" --password "$PASS" || true
 
-          echo "== Public ingress on 8000 (compat subcommand) =="
-          az containerapp ingress set -g "$RG" -n "$APP" --type external --target-port 8000
+          echo "== Public ingress on port 8000 =="
+          az containerapp ingress enable -g "$RG" -n "$APP" --type external --target-port 8000
 
-          echo "== Size & scale (adjust as needed) =="
-          az containerapp update -g "$RG" -n "$APP" --cpu 0.5 --memory 1Gi --min-replicas 1 --max-replicas 2
+          echo "== Size & scale =="
+          az containerapp update -g "$RG" -n "$APP" \
+            --cpu 0.5 --memory 1Gi --min-replicas 1 --max-replicas 2
 
-          echo "== App env vars (model paths) =="
+          echo "== App env vars (set both naming styles) =="
           az containerapp update -g "$RG" -n "$APP" \
             --set-env-vars \
-              MODEL_CKPT_CLS="/models/model_cls.pt" \
-              MODEL_CKPT_REG="/models/model_reg.pt" \
+              MODEL_CLS_PATH="/models/model_cls.pt" \
+              MODEL_REG_PATH="/models/model_reg.pt" \
               PREPROC_CLS="/models/preprocessor_cls.pkl" \
               PREPROC_REG="/models/preprocessor_reg.pkl" \
+              MODEL_CKPT_CLS="/models/model_cls.pt" \
+              MODEL_CKPT_REG="/models/model_reg.pt" \
               MODEL_VER_CLS="v1" \
               MODEL_VER_REG="v1"
+
+          echo "== (Optional) Clear command/args overrides to use Dockerfile CMD =="
+          az containerapp update -g "$RG" -n "$APP" --command "" --args "" || true
 
           echo "== Output URL =="
           FQDN=$(az containerapp show -g "$RG" -n "$APP" --query "properties.configuration.ingress.fqdn" -o tsv)
