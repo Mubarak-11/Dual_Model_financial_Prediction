@@ -27,70 +27,68 @@ jobs:
       - name: Azure login
         uses: azure/login@v2
         with:
-          # Option A: single JSON secret (recommended; you likely already have this)
           creds: ${{ secrets.AZURE_CREDENTIALS }}
-          # Option B: OIDC (uncomment if you use federated creds)
-          # client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          # tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          # subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Deploy to Azure Container Apps (robust)
-        id: deploy
+      - name: Ensure Container Apps CLI ready
         shell: bash
         run: |
           set -euo pipefail
-
-          echo "== Ensure Container Apps CLI is ready =="
           az extension add --name containerapp --upgrade
           az provider register --namespace Microsoft.App --wait
           az provider register --namespace Microsoft.OperationalInsights --wait
 
-          echo "== Resolve ACR info =="
+      # Build with Docker on the runner (NOT ACR Tasks), then push to ACR
+      - name: Build & push image with Docker
+        shell: bash
+        run: |
+          set -euo pipefail
+
           REG=$(az acr show -n "$ACR" -g "$RG" --query loginServer -o tsv)
-          USER=$(az acr credential show -n "$ACR" -g "$RG" --query username -o tsv)
-          PASS=$(az acr credential show -n "$ACR" -g "$RG" --query "passwords[0].value" -o tsv)
           IMAGE_SHA="$REG/$IMAGE_REPO:$TAG"
           IMAGE_LATEST="$REG/$IMAGE_REPO:latest"
-          echo "Image (sha): $IMAGE_SHA"
-          echo "Image (latest): $IMAGE_LATEST"
 
-          echo "== Build image in ACR =="
-          az acr build -r "$ACR" \
-            -t "$IMAGE_REPO:$TAG" \
-            -t "$IMAGE_REPO:latest" \
-            .
+          echo "== Login Docker to ACR via az =="
+          az acr login -n "$ACR"
 
-          echo "== Create or Update Container App =="
+          echo "== Build image locally on runner =="
+          docker build -t "$IMAGE_SHA" -t "$IMAGE_LATEST" .
+
+          echo "== Push both tags to ACR =="
+          docker push "$IMAGE_SHA"
+          docker push "$IMAGE_LATEST"
+
+          echo "IMAGE_SHA=$IMAGE_SHA" >> $GITHUB_ENV
+          echo "REG=$REG" >> $GITHUB_ENV
+
+      - name: Create/Update Container App
+        id: deploy
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Create if missing
           if az containerapp show -g "$RG" -n "$APP" >/dev/null 2>&1; then
             echo "Updating existing app image…"
             az containerapp update -g "$RG" -n "$APP" --image "$IMAGE_SHA"
           else
-            echo "Creating new app…"
-            az containerapp create \
-              -g "$RG" \
-              -n "$APP" \
-              --environment "$ACA_ENV" \
-              --image "$IMAGE_SHA"
+            echo "Creating app…"
+            az containerapp create -g "$RG" -n "$APP" --environment "$ACA_ENV" --image "$IMAGE_SHA"
           fi
 
-          echo "== Attach ACR registry creds (compat subcommand) =="
-          az containerapp registry set \
-            -g "$RG" -n "$APP" \
-            --server "$REG" \
-            --username "$USER" \
-            --password "$PASS"
+          echo "== Attach registry (compat subcommand) =="
+          # If admin user is disabled, this still works since the app uses managed pull via az session;
+          # if you want explicit creds, uncomment the next 3 lines:
+          # USER=$(az acr credential show -n "$ACR" -g "$RG" --query username -o tsv)
+          # PASS=$(az acr credential show -n "$ACR" -g "$RG" --query "passwords[0].value" -o tsv)
+          # az containerapp registry set -g "$RG" -n "$APP" --server "$REG" --username "$USER" --password "$PASS"
+          az containerapp registry set -g "$RG" -n "$APP" --server "$REG" || true
 
-          echo "== Public ingress on port 8000 (compat subcommand) =="
-          az containerapp ingress set \
-            -g "$RG" -n "$APP" \
-            --type external --target-port 8000
+          echo "== Public ingress on 8000 (compat subcommand) =="
+          az containerapp ingress set -g "$RG" -n "$APP" --type external --target-port 8000
 
-          echo "== Sizing & scale (tweak as needed) =="
-          az containerapp update -g "$RG" -n "$APP" \
-            --cpu 0.5 --memory 1Gi \
-            --min-replicas 1 --max-replicas 2
+          echo "== Size & scale (adjust as needed) =="
+          az containerapp update -g "$RG" -n "$APP" --cpu 0.5 --memory 1Gi --min-replicas 1 --max-replicas 2
 
-          echo "== App env vars for model paths (safe to run repeatedly) =="
+          echo "== App env vars (model paths) =="
           az containerapp update -g "$RG" -n "$APP" \
             --set-env-vars \
               MODEL_CKPT_CLS="/models/model_cls.pt" \
@@ -100,7 +98,7 @@ jobs:
               MODEL_VER_CLS="v1" \
               MODEL_VER_REG="v1"
 
-          echo "== Show URL =="
+          echo "== Output URL =="
           FQDN=$(az containerapp show -g "$RG" -n "$APP" --query "properties.configuration.ingress.fqdn" -o tsv)
           echo "fqdn=$FQDN" >> "$GITHUB_OUTPUT"
           echo "Public URL: https://$FQDN"
