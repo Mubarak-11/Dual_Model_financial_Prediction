@@ -1,4 +1,4 @@
-name: Build & Deploy Paysim API
+name: Build & Deploy — paysim-api (ACA)
 
 on:
   push:
@@ -6,144 +6,104 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-and-deploy:
+  build-deploy:
     runs-on: ubuntu-latest
     permissions:
-      id-token: write
       contents: read
+      id-token: write
 
-    # === Non-secret config ===
     env:
-      RESOURCE_GROUP: Fraud_detection                 # Your RG
-      APP_NAME: paysim-api                            # Container App name
-      REGISTRY: containerregfrauddetect.azurecr.io    # ACR login server (no https://)
-      LOCATION: canadacentral                         # Azure region for the env
+      RG: Fraud_detection
+      ACR: containerregfrauddetect
+      APP: paysim-api
+      ACA_ENV: env-paysim-api
+      IMAGE_REPO: paysim-api
+      TAG: ${{ github.sha }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Azure Login (OIDC)
+      - name: Azure login
         uses: azure/login@v2
         with:
+          # Option A: single JSON secret (recommended; you likely already have this)
           creds: ${{ secrets.AZURE_CREDENTIALS }}
+          # Option B: OIDC (uncomment if you use federated creds)
+          # client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          # tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          # subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      # Sanity check your registry value
-      - name: Verify REGISTRY env
-        run: |
-          echo "REGISTRY=$REGISTRY"
-          if [ -z "$REGISTRY" ]; then
-            echo "ERROR: REGISTRY env is empty"; exit 1
-          fi
-          case "$REGISTRY" in
-            http*|*/*) echo "ERROR: REGISTRY must be just the hostname (e.g. containerregfrauddetect.azurecr.io)"; exit 1 ;;
-          esac
-
-      # Login to ACR for docker push using admin creds stored in repo secrets
-      - name: Docker login to ACR
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ secrets.ACR_USERNAME }}
-          password: ${{ secrets.ACR_PASSWORD }}
-
-      - name: Build & Push image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ./Dockerfile
-          push: true
-          tags: |
-            ${{ env.REGISTRY }}/paysim-api:latest
-            ${{ env.REGISTRY }}/paysim-api:${{ github.sha }}
-
-      # Make sure provider namespaces and extension are available
-      - name: Ensure providers + containerapp extension
-        run: |
-          set -e
-          for NS in Microsoft.App Microsoft.OperationalInsights; do
-            az provider register --namespace $NS || true
-            for i in {1..20}; do
-              STATE=$(az provider show --namespace $NS --query registrationState -o tsv || echo "Unknown")
-              echo "$NS: $STATE"
-              [ "$STATE" = "Registered" ] && break
-              sleep 10
-            done
-            [ "$STATE" = "Registered" ] || { echo "ERROR: $NS not registered"; exit 1; }
-          done
-
-          # Ensure the containerapp CLI extension exists
-          az extension add --name containerapp --upgrade -y || az extension update --name containerapp -y
-
-      - name: Ensure Container Apps environment (creates LA workspace if missing)
-        run: |
-          set -e
-          RG="${RESOURCE_GROUP}"
-          LOC="${LOCATION}"
-          APP="${APP_NAME}"
-
-          # Names for workspace/env (safe chars)
-          SAFE_APP=$(echo "$APP" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | sed 's/^-//;s/-$//')
-          WS="law-$SAFE_APP"
-          ENV="env-$SAFE_APP"
-
-          # Create Log Analytics workspace if missing
-          if ! az monitor log-analytics workspace show -g "$RG" -n "$WS" &>/dev/null; then
-            az monitor log-analytics workspace create -g "$RG" -n "$WS" -l "$LOC"
-          fi
-          LAW_ID=$(az monitor log-analytics workspace show -g "$RG" -n "$WS" --query customerId -o tsv)
-          LAW_KEY=$(az monitor log-analytics workspace get-shared-keys -g "$RG" -n "$WS" --query primarySharedKey -o tsv)
-
-          # Create Container Apps env if missing
-          if ! az containerapp env show -g "$RG" -n "$ENV" &>/dev/null; then
-            az containerapp env create \
-              -g "$RG" -n "$ENV" -l "$LOC" \
-              --logs-workspace-id "$LAW_ID" \
-              --logs-workspace-key "$LAW_KEY"
-          fi
-
-          echo "ENV_NAME=$ENV" >> $GITHUB_ENV
-
-      - name: Create or Update Container App
+      - name: Deploy to Azure Container Apps (robust)
         id: deploy
+        shell: bash
         run: |
-          set -e
-          RG="${RESOURCE_GROUP}"
-          APP="${APP_NAME}"
-          ENV="${ENV_NAME}"
-          REG="${REGISTRY}"
-          IMAGE="${REG}/paysim-api:latest"
-          USER="${{ secrets.ACR_USERNAME }}"
-          PASS="${{ secrets.ACR_PASSWORD }}"
+          set -euo pipefail
 
-          # Create if missing, otherwise update
-          if az containerapp show -g "$RG" -n "$APP" &>/dev/null; then
-            az containerapp update \
-              -g "$RG" -n "$APP" \
-              --image "$IMAGE" \
-              --registry-server "$REG" \
-              --registry-username "$USER" \
-              --registry-password "$PASS" \
-              --target-port 8000 \
-              --ingress external \
-              --min-replicas 0 --max-replicas 1 \
-              --cpu 0.25 --memory 0.5Gi >/dev/null
+          echo "== Ensure Container Apps CLI is ready =="
+          az extension add --name containerapp --upgrade
+          az provider register --namespace Microsoft.App --wait
+          az provider register --namespace Microsoft.OperationalInsights --wait
+
+          echo "== Resolve ACR info =="
+          REG=$(az acr show -n "$ACR" -g "$RG" --query loginServer -o tsv)
+          USER=$(az acr credential show -n "$ACR" -g "$RG" --query username -o tsv)
+          PASS=$(az acr credential show -n "$ACR" -g "$RG" --query "passwords[0].value" -o tsv)
+          IMAGE_SHA="$REG/$IMAGE_REPO:$TAG"
+          IMAGE_LATEST="$REG/$IMAGE_REPO:latest"
+          echo "Image (sha): $IMAGE_SHA"
+          echo "Image (latest): $IMAGE_LATEST"
+
+          echo "== Build image in ACR =="
+          az acr build -r "$ACR" \
+            -t "$IMAGE_REPO:$TAG" \
+            -t "$IMAGE_REPO:latest" \
+            .
+
+          echo "== Create or Update Container App =="
+          if az containerapp show -g "$RG" -n "$APP" >/dev/null 2>&1; then
+            echo "Updating existing app image…"
+            az containerapp update -g "$RG" -n "$APP" --image "$IMAGE_SHA"
           else
+            echo "Creating new app…"
             az containerapp create \
-              -g "$RG" -n "$APP" \
-              --environment "$ENV" \
-              --image "$IMAGE" \
-              --registry-server "$REG" \
-              --registry-username "$USER" \
-              --registry-password "$PASS" \
-              --target-port 8000 \
-              --ingress external \
-              --min-replicas 0 --max-replicas 1 \
-              --cpu 0.25 --memory 0.5Gi >/dev/null
+              -g "$RG" \
+              -n "$APP" \
+              --environment "$ACA_ENV" \
+              --image "$IMAGE_SHA"
           fi
 
-          FQDN=$(az containerapp show -g "$RG" -n "$APP" --query "properties.configuration.ingress.fqdn" -o tsv)
-          echo "FQDN=$FQDN" >> $GITHUB_OUTPUT
+          echo "== Attach ACR registry creds (compat subcommand) =="
+          az containerapp registry set \
+            -g "$RG" -n "$APP" \
+            --server "$REG" \
+            --username "$USER" \
+            --password "$PASS"
 
-      - name: Show public URL
-        run: echo "https://${{ steps.deploy.outputs.FQDN }}"
+          echo "== Public ingress on port 8000 (compat subcommand) =="
+          az containerapp ingress set \
+            -g "$RG" -n "$APP" \
+            --type external --target-port 8000
+
+          echo "== Sizing & scale (tweak as needed) =="
+          az containerapp update -g "$RG" -n "$APP" \
+            --cpu 0.5 --memory 1Gi \
+            --min-replicas 1 --max-replicas 2
+
+          echo "== App env vars for model paths (safe to run repeatedly) =="
+          az containerapp update -g "$RG" -n "$APP" \
+            --set-env-vars \
+              MODEL_CKPT_CLS="/models/model_cls.pt" \
+              MODEL_CKPT_REG="/models/model_reg.pt" \
+              PREPROC_CLS="/models/preprocessor_cls.pkl" \
+              PREPROC_REG="/models/preprocessor_reg.pkl" \
+              MODEL_VER_CLS="v1" \
+              MODEL_VER_REG="v1"
+
+          echo "== Show URL =="
+          FQDN=$(az containerapp show -g "$RG" -n "$APP" --query "properties.configuration.ingress.fqdn" -o tsv)
+          echo "fqdn=$FQDN" >> "$GITHUB_OUTPUT"
+          echo "Public URL: https://$FQDN"
+
+      - name: Print public URL
+        run: echo "https://${{ steps.deploy.outputs.fqdn }}"
