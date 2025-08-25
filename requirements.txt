@@ -2,6 +2,7 @@
 # API
 fastapi==0.112.2
 uvicorn[standard]==0.30.6
+prometheus-fastapi-instrumentator==6.1.0
 
 # ML stack
 torch==2.3.1

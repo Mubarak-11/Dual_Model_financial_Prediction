@@ -30,6 +30,18 @@ app = FastAPI(title="Paysim Dual Model API", version="1.0")
 MODEL_CLS = MODEL_REG = None
 PROC_CLS = PROC_REG = None
 
+# Prometheus metrics at /metrics
+try:
+    from prometheus_fastapi_instrumentator import Instrumentator
+
+    Instrumentator(
+        excluded_handlers=["/health", "/ready", "/metrics"]  # keep noise out
+    ).instrument(app).expose(app, endpoint="/metrics")
+except Exception:
+    # don’t crash if the package isn’t installed
+    pass
+
+
 def row_to_df(features: Dict[str, Any]) -> pd.DataFrame:
     row = {c: features.get(c, np.nan) for c in BASE_COLS}
     return pd.DataFrame([row])
